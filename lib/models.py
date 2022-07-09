@@ -112,7 +112,7 @@ class BandedJointEncoder(tf.keras.Model):
             mapped_values = tf.reshape(mapped_reshaped[:, :, :-1], [-1])
             prec_sparse = tf.sparse.SparseTensor(indices=idxs_all, values=mapped_values, dense_shape=dense_shape)
             prec_sparse = tf.sparse.reorder(prec_sparse)
-            prec_tril = tf.sparse_add(tf.zeros(prec_sparse.dense_shape, dtype=tf.float32), prec_sparse)
+            prec_tril = tf.compat.v1.sparse_add(tf.zeros(prec_sparse.dense_shape, dtype=tf.float32), prec_sparse)
             eye = tf.eye(num_rows=prec_tril.shape.as_list()[-1], batch_shape=prec_tril.shape.as_list()[:-2])
             prec_tril = prec_tril + eye
             cov_tril = tf.linalg.triangular_solve(matrix=prec_tril, rhs=eye, lower=False)
