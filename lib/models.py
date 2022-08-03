@@ -13,23 +13,32 @@ import tensorflow as tf
 
 # Encoders
 
-class DiagonalEncoder(tf.keras.Model):
-    def __init__(self, z_size, hidden_sizes=(64, 64), **kwargs):
+class diagonal_encoder(tf.keras.Model):
+    def __init__(self, encoder_net, z_size, retain_enc_state=False, **kwargs):
         """ Encoder with factorized Normal posterior over temporal dimension
             Used by disjoint VAE and HI-VAE with Standard Normal prior
             :param z_size: latent space dimensionality
             :param hidden_sizes: tuple of hidden layer sizes.
                                  The tuple length sets the number of hidden layers.
         """
-        super(DiagonalEncoder, self).__init__()
+        super(diagonal_encoder, self).__init__()
         self.z_size = int(z_size)
-        self.net = make_nn(2*z_size, hidden_sizes)
+        self.retain_enc_state = retain_enc_state
+        self.net = encoder_net
 
-    def __call__(self, x):
-        mapped = self.net(x)
-        return tfd.MultivariateNormalDiag(
-          loc=mapped[..., :self.z_size],
-          scale_diag=tf.nn.softplus(mapped[..., self.z_size:]))
+    def __call__(self, x, states=None):
+        if self.retain_enc_state:
+            enc_outputs = self.net(x,states=states) 
+            mapped = enc_outputs[0]
+            final_state = enc_outputs[1]
+        else:
+            mapped = self.net(x) 
+        z_dist = tfd.MultivariateNormalDiag(loc=mapped[..., :self.z_size],
+                                            scale_diag=tf.nn.softplus(mapped[..., self.z_size:]))
+        if self.retain_enc_state:
+            return z_dist, final_state
+        else:
+            return z_dist 
 
 
 class JointEncoder(tf.keras.Model):
@@ -62,43 +71,55 @@ class JointEncoder(tf.keras.Model):
 
 
 class BandedJointEncoder(tf.keras.Model):
-    def __init__(self, z_size, hidden_sizes=(64, 64), window_size=3, data_type=None, **kwargs):
+    def __init__(self, encoder_net, z_size, data_type=None, retain_enc_state=False, **kwargs):
         """ Encoder with 1d-convolutional network and multivariate Normal posterior
             Used by GP-VAE with proposed banded covariance matrix
             :param z_size: latent space dimensionality
-            :param hidden_sizes: tuple of hidden layer sizes.
-                                 The tuple length sets the number of hidden layers.
-            :param window_size: kernel size for Conv1D layer
+            
+            
             :param data_type: needed for some data specific modifications, e.g:
                 tf.nn.softplus is a more common and correct choice, however
                 tf.nn.sigmoid provides more stable performance on Physionet dataset
         """
         super(BandedJointEncoder, self).__init__()
         self.z_size = int(z_size)
-        self.net = make_cnn(3*z_size, hidden_sizes, window_size)
+        self.net = encoder_net
         self.data_type = data_type
+        self.retain_enc_state = retain_enc_state
+        #self.net = make_encoder_cnn(conv_out_channels=[128,128,128], kernel_sizes=[5,5,5], fc_sizes=[128,3*z_size])
 
-    def __call__(self, x):
-        mapped = self.net(x)
+    def __call__(self, x, states=None):
+        # encode the input. The encoded input has shape [batch_size, time_len, 3 * z_dim]
+        if self.retain_enc_state:
+            enc_outputs = self.net(x,states=states) 
+            mapped = enc_outputs[0]
+            final_state = enc_outputs[1]
+        else:
+            mapped = self.net(x) 
 
         batch_size = mapped.shape.as_list()[0]
         time_length = mapped.shape.as_list()[1]
 
-        # Obtain mean and precision matrix components
+        # transpose the encoded input Z and time dimensions: it has now a shape [batch_size, 3 * z_dim, time_len]
         num_dim = len(mapped.shape.as_list())
         perm = list(range(num_dim - 2)) + [num_dim - 1, num_dim - 2]
         mapped_transposed = tf.transpose(mapped, perm=perm)
+        
+        # Obtain mean and precision matrix components
+        # each time point in the encoded input has 3 * z_dim features. first z_dim features are used to create the mean of the Z distribution
+        # so mapped_mean shape is (batch_size, z_dim, time_length)
         mapped_mean = mapped_transposed[:, :self.z_size]
+        # and the rest 2 * z_dim features are used to create the precision matrix, so mapped_covar shape is (batch_size, 2 * z_dim, time_length)
         mapped_covar = mapped_transposed[:, self.z_size:]
-
         # tf.nn.sigmoid provides more stable performance on Physionet dataset
         if self.data_type == 'physionet':
             mapped_covar = tf.nn.sigmoid(mapped_covar)
         else:
             mapped_covar = tf.nn.softplus(mapped_covar)
-
+        # reshaping the precision features array to shape of [batch_size, z_dim, 2 * time_length]
+        # i.e. every z variable has now two numbers for every time point
         mapped_reshaped = tf.reshape(mapped_covar, [batch_size, self.z_size, 2*time_length])
-
+        
         dense_shape = [batch_size, self.z_size, time_length, time_length]
         idxs_1 = np.repeat(np.arange(batch_size), self.z_size*(2*time_length-1))
         idxs_2 = np.tile(np.repeat(np.arange(self.z_size), (2*time_length-1)), batch_size)
@@ -121,21 +142,190 @@ class BandedJointEncoder(tf.keras.Model):
         num_dim = len(cov_tril.shape)
         perm = list(range(num_dim - 2)) + [num_dim - 1, num_dim - 2]
         cov_tril_lower = tf.transpose(cov_tril, perm=perm)
+        
+        # the output is basically z_dim distributions - i.e. normal vectors with time_length coordinates
         z_dist = tfd.MultivariateNormalTriL(loc=mapped_mean, scale_tril=cov_tril_lower)
-        return z_dist
+        if self.retain_enc_state:
+            return z_dist, final_state
+        else:
+            return z_dist
+
+class encoder_rnn(tf.keras.Model):
+    def __init__(self, input_size, batch_size, rnn_hidden_sizes, fc_sizes, rnn_cell, stateful, return_state=False):
+        super(encoder_rnn, self).__init__()
+        self.input_size = input_size
+        self.batch_size = batch_size
+        self.rnn_hidden_sizes = rnn_hidden_sizes
+        self.fc_sizes = fc_sizes
+        self.rnn_cell = rnn_cell
+        self.stateful = stateful
+        self.return_state = return_state
+        self.net = self.build_arch()
+    
+    def build_arch(self):
+        layers = [tf.keras.Input(shape=self.input_size, batch_size=self.batch_size)]
+        # stacking RNN layers
+        for i in range(len(self.rnn_hidden_sizes)):
+            if self.rnn_cell == 'lstm':
+                layers.append(tf.keras.layers.LSTM(self.rnn_hidden_sizes[i], return_sequences=True, stateful=self.stateful, name=f"LSTM_{i}", return_state=self.return_state))
+            elif self.rnn_cell == 'gru':
+                layers.append(tf.keras.layers.GRU(self.rnn_hidden_sizes[i], return_sequences=True, stateful=self.stateful, name=f"GRU_{i}", return_state=self.return_state))
+            else:
+                assert "rnn cell must be either LSTM or GRU"
+        if len(self.fc_sizes) >= 1:
+            for i in range(len(self.fc_sizes)):
+                layers.append(tf.keras.layers.Dense(units=self.fc_sizes[i], dtype=tf.float32))
+                layers.append(tf.keras.layers.LeakyReLU())
+        return tf.keras.Sequential(layers)
+
+    def call(self, x, state=None):
+        if self.return_state:
+            output, state = self.net(x)
+            return output, state
+        else:
+            output = self.net(x)
+            return output
+
+class decoder_rnn(encoder_rnn):
+    def __init__(self, input_size, batch_size, output_dim, rnn_hidden_sizes, rnn_cell, fc_sizes, stateful,return_state=False):
+        self.output_dim = output_dim
+        super(decoder_rnn, self).__init__(input_size=input_size, 
+                                          batch_size=batch_size, 
+                                          rnn_hidden_sizes=rnn_hidden_sizes, 
+                                          rnn_cell=rnn_cell, 
+                                          fc_sizes=fc_sizes, 
+                                          stateful=stateful,return_state=return_state)
+        # in the decoder, we always have a fully connected layer with linear activation at the output, in order to support any range of output values
+        self.net.add(tf.keras.layers.Dense(units=self.output_dim, dtype=tf.float32))
 
 
+
+def build_rnn(input_size, batch_size, rnn_hidden_sizes, fc_sizes, activations, rnn_cell, stateful, return_state=False):
+    
+    inputs = tf.keras.Input(shape=input_size, batch_size=batch_size)
+    #init_states = tf.keras.Input(shape=input_size, batch_size=batch_size)
+    rnn_layers = []
+    # stacking RNN layers
+    for i in range(len(rnn_hidden_sizes)):
+        if rnn_cell == 'lstm':
+            rnn_layers.append(tf.keras.layers.LSTM(rnn_hidden_sizes[i], return_sequences=True, stateful=stateful, name=f"LSTM_{i}", return_state=return_state))
+        elif rnn_cell == 'gru':
+            rnn_layers.append(tf.keras.layers.GRU(rnn_hidden_sizes[i], return_sequences=True, stateful=stateful, name=f"GRU_{i}", return_state=return_state))
+        else:
+            assert "rnn cell must be either LSTM or GRU"
+    fc_layers = []
+    if len(fc_sizes) >= 1:
+        for i in range(len(fc_sizes)):
+            fc_layers.append(tf.keras.layers.Dense(units=fc_sizes[i], activation=activations[i] ,dtype=tf.float32))
+                
+    
+    
+    x = inputs
+    final_states = []
+    for i in range(len(rnn_layers)):
+        if return_state:
+            x, final_state = rnn_layers[i](x)
+            final_states.append(final_state)
+        else:
+            x = rnn_layers[i](x)
+        
+    for i in range(len(fc_layers)):
+        x = fc_layers[i](x)
+    if return_state:
+        final_states = tf.stack(final_states,axis=2)
+        model = tf.keras.Model(inputs=inputs, outputs=[x,final_states])
+    else:
+        model = tf.keras.Model(inputs=inputs, outputs=x)
+
+    return model
+
+
+
+class rnn(tf.keras.Model):
+    def __init__(self,input_size, batch_size, rnn_hidden_sizes, fc_sizes, activations, rnn_cell, stateful, return_state=False, add_activation_on_last_fc_layer=True, name='enc'):
+        super(rnn, self).__init__()
+        self.return_state = return_state
+        self.input_size = input_size
+        self.batch_size = batch_size
+        self.rnn_layers = []
+        # stacking RNN layers
+        for i in range(len(rnn_hidden_sizes)):
+            if rnn_cell == 'lstm':
+                self.rnn_layers.append(tf.keras.layers.LSTM(rnn_hidden_sizes[i], return_sequences=True, stateful=stateful, name=f"{name}_LSTM_{i}", return_state=return_state))
+            elif rnn_cell == 'gru':
+                self.rnn_layers.append(tf.keras.layers.GRU(rnn_hidden_sizes[i], return_sequences=True, stateful=stateful, name=f"{name}_GRU_{i}", return_state=return_state))
+            else:
+                assert "rnn cell must be either LSTM or GRU"
+        self.fc_layers = []
+        if len(fc_sizes) >= 1:
+            for i in range(len(fc_sizes)):
+                self.fc_layers.append(tf.keras.layers.Dense(units=fc_sizes[i] ,dtype=tf.float32, name=f"{name}_dense_{i}"))
+                if (i < len(fc_sizes)-1) or add_activation_on_last_fc_layer:
+                    self.fc_layers.append(tf.keras.layers.LeakyReLU(name=f"{name}_activation_{i}"))
+    
+    def call(self,inputs,states=None):
+        if states is not None:
+            assert len(states) == len(self.rnn_layers), "every rnn layer must have an initial state"
+        x = inputs
+        final_states = []
+        for i in range(len(self.rnn_layers)):
+            if self.return_state:
+                if states is not None:
+                    x, final_state = self.rnn_layers[i](inputs=x,initial_state=states[i])
+                else:
+                    x, final_state = self.rnn_layers[i](inputs=x)
+                final_states.append(final_state)
+            else:
+                x = rnn_layers[i](x)
+            
+        for i in range(len(self.fc_layers)):
+            x = self.fc_layers[i](x)
+        if self.return_state:
+            return x,final_states
+        else:
+            return x
+
+    def model(self):
+        x = tf.keras.Input(shape=self.input_size, batch_size=self.batch_size)
+        return tf.keras.Model(inputs=[x], outputs=self.call(x))
+        
+    
+        
 # Decoders
 
+class cnn_decoder(tf.keras.Model):
+    def __init__(self, conv_out_channels, kernel_sizes):
+        """ 
+        Decoder parent class with no specified output distribution
+        :param output_size: list of output feature map sizes.
+        :param kernel_sizes: list of kernel sizes
+        """
+        super(cnn_decoder, self).__init__()
+        self.net = make_decoder_cnn(conv_out_channels, kernel_sizes)
+
+    def __call__(self, x):
+        pass
+
+class gaussian_cnn_decoder(cnn_decoder):
+    """ 
+    Decoder with Gaussian output distribution.
+    """
+    def __call__(self, x):
+        mean = self.net(x)
+        var = tf.ones(tf.shape(mean), dtype=tf.float32)
+        return tfd.Normal(loc=mean, scale=var)
+
+
 class Decoder(tf.keras.Model):
-    def __init__(self, output_size, hidden_sizes=(64, 64)):
-        """ Decoder parent class with no specified output distribution
-            :param output_size: output dimensionality
-            :param hidden_sizes: tuple of hidden layer sizes.
-                                 The tuple length sets the number of hidden layers.
+    def __init__(self, decoder_net,retain_dec_state=False):
+        """ 
+        Decoder parent class with no specified output distribution
+            :param decoder_net: A tf.keras.Model implementing the decoder arch
+            :param retain_dec_state: Boolean - used in RNN based decoders and directs the decoder wether to retain its state between calls
         """
         super(Decoder, self).__init__()
-        self.net = make_nn(output_size, hidden_sizes)
+        self.retain_dec_state = retain_dec_state
+        self.net = decoder_net
 
     def __call__(self, x):
         pass
@@ -149,11 +339,40 @@ class BernoulliDecoder(Decoder):
 
 
 class GaussianDecoder(Decoder):
-    """ Decoder with Gaussian output distribution (used for SPRITES and Physionet) """
-    def __call__(self, x):
-        mean = self.net(x)
+    """ Decoder with Gaussian output distribution """
+    def __call__(self, x, states=None):
+        if self.retain_dec_state:
+            mean, final_state = self.net(x,states=states) 
+            
+        else:
+            mean = self.net(x)
+
+
         var = tf.ones(tf.shape(mean), dtype=tf.float32)
-        return tfd.Normal(loc=mean, scale=var)
+        if self.retain_dec_state:
+            return tfd.Normal(loc=mean, scale=var), final_state
+        else:
+            return tfd.Normal(loc=mean, scale=var)
+
+
+class gaussian_decoder_learned_variance(Decoder):
+    """ Decoder with Gaussian output distribution """
+    def __call__(self, x, states=None):
+        # get a decoder output with shape (batch_size, seq_len, 2*data_dim)
+        if self.retain_dec_state:
+            dec_out, final_state = self.net(x,states=states)
+        else:
+            dec_out = self.net(x)
+        # obtain mean and variance
+        data_dim = dec_out.shape[2] // 2
+        mean = dec_out[:,:,:data_dim]
+        var = dec_out[:,:,data_dim:]
+
+        
+        if self.retain_dec_state:
+            return tfd.Normal(loc=mean, scale=var), final_state
+        else:
+            return tfd.Normal(loc=mean, scale=var)
 
 
 # Image preprocessor
@@ -178,20 +397,15 @@ class ImagePreprocessor(tf.keras.Model):
 
 class VAE(tf.keras.Model):
     def __init__(self, latent_dim, data_dim, time_length,
-                 encoder_sizes=(64, 64), encoder=DiagonalEncoder,
-                 decoder_sizes=(64, 64), decoder=BernoulliDecoder,
-                 image_preprocessor=None, beta=1.0, M=1, K=1, **kwargs):
+                 encoder,
+                 decoder, beta=1.0, M=1, K=1, retain_enc_state=False, retain_dec_state=False, **kwargs):
         """ Basic Variational Autoencoder with Standard Normal prior
             :param latent_dim: latent space dimensionality
             :param data_dim: original data dimensionality
             :param time_length: time series duration
-            
-            :param encoder_sizes: layer sizes for the encoder network
             :param encoder: encoder model class {Diagonal, Joint, BandedJoint}Encoder
-            :param decoder_sizes: layer sizes for the decoder network
             :param decoder: decoder model class {Bernoulli, Gaussian}Decoder
             
-            :param image_preprocessor: 2d-convolutional network used for image data preprocessing
             :param beta: tradeoff coefficient between reconstruction and KL terms in ELBO
             :param M: number of Monte Carlo samples for ELBO estimation
             :param K: number of importance weights for IWAE model (see: https://arxiv.org/abs/1509.00519)
@@ -200,31 +414,54 @@ class VAE(tf.keras.Model):
         self.latent_dim = latent_dim
         self.data_dim = data_dim
         self.time_length = time_length
-
-        self.encoder = encoder(latent_dim, encoder_sizes, **kwargs)
-        self.decoder = decoder(data_dim, decoder_sizes)
-        self.preprocessor = image_preprocessor
-
+        self.encoder = encoder
+        self.decoder = decoder
         self.beta = beta
+        self.prior = None
         self.K = K
         self.M = M
-
-    def encode(self, x):
+        self.retain_enc_state = retain_enc_state
+        self.retain_dec_state = retain_dec_state
+        self.encoder_final_state = None
+        self.decoder_final_state = None
+    def encode(self, x, states=None):
         x = tf.identity(x)  # in case x is not a Tensor already...
-        if self.preprocessor is not None:
-            x_shape = x.shape.as_list()
-            new_shape = [x_shape[0] * x_shape[1]] + list(self.preprocessor.image_shape)
-            x_reshaped = tf.reshape(x, new_shape)
-            x_preprocessed = self.preprocessor(x_reshaped)
-            x = tf.reshape(x_preprocessed, x_shape)
-        return self.encoder(x)
+        if self.retain_enc_state:
+            enc_out,self.encoder_final_state = self.encoder(x,states=states)
+        else:
+            enc_out = self.encoder(x)
+        return enc_out
 
-    def decode(self, z):
+    def decode(self, z, states=None):
         z = tf.identity(z)  # in case z is not a Tensor already...
-        return self.decoder(z)
+        if self.retain_dec_state:
+            dec_out, self.decoder_final_state = self.decoder(z,states=states)
+        else:
+            dec_out = self.decoder(z)
+        return dec_out
 
     def __call__(self, inputs):
         return self.decode(self.encode(inputs).sample()).sample()
+        #return self.decode(self.encode(inputs).sample()).mean()
+
+    def reset_enc_dec_states(self):
+        self.encoder_final_state = None
+        self.decoder_final_state = None
+
+
+    def reconstruct(self, x, enc_stateful=False, dec_stateful=False):
+        enc_state = None
+        dec_state = None
+        if enc_stateful:
+            enc_state = self.encoder_final_state
+        z = self.encode(x,enc_state)
+        z_mean = z.mean()
+        if dec_stateful:
+            dec_state = self.encoder_final_state
+        x_hat = self.decode(z_mean,dec_state)
+        x_hat_mean = x_hat.mean()
+        return x_hat_mean
+
 
     def generate(self, noise=None, num_samples=1):
         if noise is None:
@@ -354,11 +591,16 @@ class GP_VAE(HI_VAE):
         self.pz_scale_log_abs_determinant = None
         self.prior = None
 
-    def decode(self, z):
+    def decode(self, z, states=None):
         num_dim = len(z.shape)
         assert num_dim > 2
         perm = list(range(num_dim - 2)) + [num_dim - 1, num_dim - 2]
-        return self.decoder(tf.transpose(z, perm=perm))
+        zt = tf.transpose(z, perm=perm)
+        if self.retain_dec_state:
+            dec_out, self.decoder_final_state = self.decoder(zt,states=states)
+        else:
+            dec_out = self.decoder(zt)
+        return dec_out
 
     def _get_prior(self):
         if self.prior is None:
