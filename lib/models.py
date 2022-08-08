@@ -9,7 +9,7 @@ from .nn_utils import *
 from .gp_kernel import *
 from tensorflow_probability import distributions as tfd
 import tensorflow as tf
-
+from tensorflow_probability import math as tfm
 
 # Encoders
 
@@ -69,6 +69,151 @@ class JointEncoder(tf.keras.Model):
                     loc=mapped[..., :self.z_size],
                     scale_diag=tf.nn.softplus(mapped[..., self.z_size:]))
 
+class gpdir_encoder(tf.keras.Model):
+    def __init__(self, encoder_net, gz_dim, dz_dim, seq_len, gp_fc_sizes, dir_fc_sizes, alpha, retain_enc_state=False, **kwargs):
+        
+        super(gpdir_encoder, self).__init__()
+        self.gz_dim = int(gz_dim)
+        self.dz_dim = int(dz_dim)
+        self.z_dim = self.gz_dim + self.dz_dim
+        self.seq_len = int(seq_len)
+        self.retain_enc_state = retain_enc_state
+        self.alpha = alpha
+        self.net = encoder_net
+
+        # define MLP layer for learning the gaussian latent space
+        self.gp_fc_layers = []
+        if len(gp_fc_sizes) >= 1:
+            for i in range(len(gp_fc_sizes)):
+                self.gp_fc_layers.append(tf.keras.layers.Dense(units=gp_fc_sizes[i] ,dtype=tf.float32, activation='elu', name=f"gp_mlp_layer_{i}"))
+        # add two separate layers for the mean and covariance inference
+        self.latent_cov_layer = tf.keras.layers.Dense(units=((self.seq_len * (self.seq_len + 1))//2), activation='elu', dtype=tf.float32, name=f"latent_cov_layer")
+        self.latent_mean_layer = tf.keras.layers.Dense(units=self.seq_len ,activation='elu', dtype=tf.float32, name=f"latent_mean_layer")
+
+
+        # define MLP layer for learning the dirichlet latent space
+        self.dir_fc_layers = []
+        if len(dir_fc_sizes) >= 1:
+            for i in range(len(dir_fc_sizes)):
+                self.dir_fc_layers.append(tf.keras.layers.Dense(units=dir_fc_sizes[i] ,dtype=tf.float32, activation='elu', name=f"dir_mlp_layer_{i}"))
+        # define a fully connected layer to learn alpha of the dirichlet distribution. Note the activation is a softplus since all alphas should be strictly positive
+        self.latent_dirichlet_alpha_layer = tf.keras.layers.Dense(units=self.dz_dim, activation='softmax', dtype=tf.float32, name=f"latent_dirichlet_alpha_layer")
+
+    def call(self, x, states=None):
+        # encode the input. The encoded input has shape [batch_size, seq_len, hidden_size]
+        if self.retain_enc_state:
+             enc_net_outputs = self.net(x,states=states) 
+             enc_output = enc_net_outputs[0]
+             enc_state = enc_net_outputs[1]
+        else:
+            enc_output = self.net(x)
+        batch_size = enc_output.shape.as_list()[0]
+        seq_len    = enc_output.shape.as_list()[1]
+        
+        # gaussian space path
+        xg = enc_output
+        # pass through the MLP. the output should be with shape [batch_size, seq_len, gz_dim*m] 
+        for i in range(len(self.gp_fc_layers)):
+            xg = self.gp_fc_layers[i](xg)
+
+        # reshape the output to shape [batch_size, seq_len, gz_dim, m] 
+        xg = tf.reshape(tensor=xg, shape=[batch_size,seq_len,self.gz_dim,-1])
+        
+        # transpose that tensor to shape [batch_size, gz_dim, seq_len, m]
+        xg = tf.transpose(xg, perm=[0,2,1,3]) 
+        
+        # and reshape again to shape [batch_size, gz_dim, seq_len*m]
+        xg = tf.reshape(tensor=xg, shape=[batch_size,self.gz_dim,-1])
+        
+        # We now have a tensor where for each gaussian z dimension we have a vector with m*seq_len elements. 
+        
+        # Apply fully connected layers on the gaussian part to obtain mean vector and covariance matrix (full - not diagonal)
+        mean = self.latent_mean_layer(xg)
+        
+        cov_lower_values = self.latent_cov_layer(xg)
+
+        # obtain a lower triangular matrix from the covariance vector we got
+        cov_triangular_lower = tfm.fill_triangular(cov_lower_values, upper=False)
+
+        # the gaussian latent space has gz_dim distributions - i.e. normal vectors with latent_space_time_length coordinates
+        gz_dist = tfd.MultivariateNormalTriL(loc=mean, scale_tril=cov_triangular_lower)
+
+        # dirichlet space path
+        xd = enc_output
+        # flatten the encoder output. we concatenate the info from all time steps and use it to learn the time series "state" underlying the current window
+        # that state is modeled with a vector of length dz_dim
+        xd = tf.reshape(xd, shape=[xd.shape[0],-1])
+        # pass through the MLP. the output should be with shape [batch_size, output_size] 
+        for i in range(len(self.dir_fc_layers)):
+            xd = self.dir_fc_layers[i](xd)
+            
+        
+        # Apply fully connected layer on the dirichlet input to obtain a vector of alphas. output shape [batch_size,dz_dim]
+        xd = self.latent_dirichlet_alpha_layer(xd)
+        dirichlet_alphas = self.alpha * xd
+        # The dirichlet space has a single dirichlet distribution which can be sampled to obtain a dz_dim dimensional vector defined over the (dz_dim-1) simplex
+        dz_dist = tfd.Dirichlet(dirichlet_alphas)
+
+        if self.retain_enc_state:
+            return dz_dist, gz_dist, enc_state
+        else:
+            return dz_dist, gz_dist
+
+
+class full_cov_gp_encoder(tf.keras.Model):
+    def __init__(self, encoder_net, z_dim, seq_len, retain_enc_state=False, **kwargs):
+        
+        super(full_cov_gp_encoder, self).__init__()
+        self.z_dim = int(z_dim)
+        self.seq_len = int(seq_len)
+        self.retain_enc_state = retain_enc_state
+        self.net = encoder_net
+        self.latent_cov_layer = tf.keras.layers.Dense(units=((self.seq_len * (self.seq_len + 1))//2), activation='elu', dtype=tf.float32, name=f"latent_cov_layer")
+
+        self.latent_mean_layer = tf.keras.layers.Dense(units=self.seq_len ,activation='elu', dtype=tf.float32, name=f"latent_mean_layer")
+                
+
+    def call(self, x, states=None):
+        # encode the input. The encoded input has shape [batch_size, seq_len, z_dim*m]
+        if self.retain_enc_state:
+             enc_net_outputs = self.net(x,states=states) 
+             enc_output = enc_net_outputs[0]
+             enc_state = enc_net_outputs[1]
+        else:
+            enc_output = self.net(x)
+        
+        batch_size = enc_output.shape.as_list()[0]
+        seq_len    = enc_output.shape.as_list()[1]
+
+        # reshape the output to shape [batch_size, seq_len, z_dim, m] 
+        enc_output_reshaped_per_z = tf.reshape(tensor=enc_output, shape=[batch_size,seq_len,self.z_dim,-1])
+        
+        # transpose that tensor to shape [batch_size, z_dim, seq_len, m]
+        enc_output_z_first = tf.transpose(enc_output_reshaped_per_z, perm=[0,2,1,3]) 
+        
+        # and reshape again to shape [batch_size, z_dim, seq_len*m]
+        enc_output_z_first_reshaped = tf.reshape(tensor=enc_output_z_first, shape=[batch_size,self.z_dim,-1])
+        
+        # we now have a tensor where for each z dimension we have a vector with m*seq_len elements, from which we can learn the mean vector and covariance 
+        # matrix
+        mean = self.latent_mean_layer(enc_output_z_first_reshaped)
+        
+        cov_lower_values = self.latent_cov_layer(enc_output_z_first_reshaped)
+
+        # obtain a lower triangular matrix from the covariance vector we got
+        cov_triangular_lower = tfm.fill_triangular(cov_lower_values, upper=False)
+
+        # the output is basically z_dim distributions - i.e. normal vectors with latent_space_time_length coordinates
+        z_dist = tfd.MultivariateNormalTriL(loc=mean, scale_tril=cov_triangular_lower)
+        if self.retain_enc_state:
+            return z_dist, enc_state
+        else:
+            return z_dist
+
+    def model(self):
+        x = tf.keras.Input(shape=self.input_size, batch_size=self.batch_size)
+        return tf.keras.Model(inputs=[x], outputs=self.call(x))
+
 
 class BandedJointEncoder(tf.keras.Model):
     def __init__(self, encoder_net, z_size, data_type=None, retain_enc_state=False, **kwargs):
@@ -91,9 +236,8 @@ class BandedJointEncoder(tf.keras.Model):
     def __call__(self, x, states=None):
         # encode the input. The encoded input has shape [batch_size, time_len, 3 * z_dim]
         if self.retain_enc_state:
-            enc_outputs = self.net(x,states=states) 
-            mapped = enc_outputs[0]
-            final_state = enc_outputs[1]
+            enc_output, enc_states = self.net(x,states=states) 
+            mapped = enc_output
         else:
             mapped = self.net(x) 
 
@@ -146,7 +290,7 @@ class BandedJointEncoder(tf.keras.Model):
         # the output is basically z_dim distributions - i.e. normal vectors with time_length coordinates
         z_dist = tfd.MultivariateNormalTriL(loc=mapped_mean, scale_tril=cov_tril_lower)
         if self.retain_enc_state:
-            return z_dist, final_state
+            return z_dist, enc_states
         else:
             return z_dist
 
@@ -271,12 +415,13 @@ class rnn(tf.keras.Model):
         for i in range(len(self.rnn_layers)):
             if self.return_state:
                 if states is not None:
-                    x, final_state = self.rnn_layers[i](inputs=x,initial_state=states[i])
+                    init_state = tf.stop_gradient(tf.identity(states[i]))
+                    x, final_state = self.rnn_layers[i](inputs=x,initial_state=init_state)
                 else:
                     x, final_state = self.rnn_layers[i](inputs=x)
                 final_states.append(final_state)
             else:
-                x = rnn_layers[i](x)
+                x = self.rnn_layers[i](x)
             
         for i in range(len(self.fc_layers)):
             x = self.fc_layers[i](x)
@@ -289,9 +434,157 @@ class rnn(tf.keras.Model):
         x = tf.keras.Input(shape=self.input_size, batch_size=self.batch_size)
         return tf.keras.Model(inputs=[x], outputs=self.call(x))
         
+class cnn_rnn(tf.keras.Model):
+    def __init__(self,input_size, batch_size, rnn_hidden_sizes, conv_out_channels, conv_kernel_sizes, fc_sizes, activations, rnn_cell, stateful, return_state=False, name='enc'):
+        super(cnn_rnn, self).__init__()
+        self.return_state = return_state
+        self.input_size = input_size
+        self.batch_size = batch_size
+        self.cnn_layers = []
+        self.rnn_layers = []
+        self.fc_layers  = []
+        # stacking CNN layers
+        for i in range(len(conv_out_channels)):
+            self.cnn_layers.append(tf.keras.layers.Conv1D(filters=conv_out_channels[i], 
+                                                 kernel_size=conv_kernel_sizes[i], 
+                                                 strides=2, 
+                                                 padding="same", 
+                                                 activation=activations[i],
+                                                 dtype=tf.float32))
+            
+        # stacking RNN layers
+        for i in range(len(rnn_hidden_sizes)):
+            if rnn_cell == 'lstm':
+                self.rnn_layers.append(tf.keras.layers.LSTM(rnn_hidden_sizes[i], return_sequences=True, stateful=stateful, name=f"{name}_LSTM_{i}", return_state=return_state))
+            elif rnn_cell == 'gru':
+                self.rnn_layers.append(tf.keras.layers.GRU(rnn_hidden_sizes[i], return_sequences=True, stateful=stateful, name=f"{name}_GRU_{i}", return_state=return_state))
+            else:
+                assert "rnn cell must be either LSTM or GRU"
+        
+        if len(fc_sizes) >= 1:
+            for i in range(len(fc_sizes)):
+                self.fc_layers.append(tf.keras.layers.Dense(units=fc_sizes[i] ,dtype=tf.float32, activation='elu', name=f"{name}_dense_{i}"))
+                
     
+    def call(self,inputs,states=None):
+        if states is not None:
+            assert len(states) == len(self.rnn_layers), "every rnn layer must have an initial state"
+        x = inputs
+        for i in range(len(self.cnn_layers)):
+            x = self.cnn_layers[i](x)
+        # forward pass through the rnn layers
+        final_states = []
+        for i in range(len(self.rnn_layers)):
+            if self.return_state:
+                if states is not None:
+                    init_state = tf.stop_gradient(tf.identity(states[i]))
+                    x, final_state = self.rnn_layers[i](inputs=x,initial_state=init_state)
+                else:
+                    x, final_state = self.rnn_layers[i](inputs=x)
+                final_states.append(final_state)
+            else:
+                x = self.rnn_layers[i](x)
+            
+        for i in range(len(self.fc_layers)):
+            x = self.fc_layers[i](x)
+        if self.return_state:
+            return x,final_states
+        else:
+            return x
+
+    def model(self):
+        x = tf.keras.Input(shape=self.input_size, batch_size=self.batch_size)
+        return tf.keras.Model(inputs=[x], outputs=self.call(x))
+        
         
 # Decoders
+
+
+class rnn_deconv(tf.keras.Model):
+    def __init__(self,
+                 input_size, 
+                 batch_size,
+                 rnn_cell,
+                 rnn_hidden_sizes, 
+                 deconv_out_channels, 
+                 deconv_kernel_sizes,
+                 deconv_strides,
+                 deconv_output_padding, 
+                 deconv_activations,
+                 out_fc_sizes,
+                 out_fc_activations,
+                 return_state=False, 
+                 name='dec'):
+        super(rnn_deconv, self).__init__()
+        self.return_state = return_state
+        self.input_size = input_size
+        self.batch_size = batch_size
+        self.deconv_layers = []
+        self.rnn_layers = []
+        self.out_fc_layers = []
+        
+
+        # stacking RNN layers
+        for i in range(len(rnn_hidden_sizes)):
+            if rnn_cell == 'lstm':
+                self.rnn_layers.append(tf.keras.layers.LSTM(rnn_hidden_sizes[i], return_sequences=True, stateful=False, name=f"{name}_LSTM_{i}", return_state=return_state))
+            elif rnn_cell == 'gru':
+                self.rnn_layers.append(tf.keras.layers.GRU(rnn_hidden_sizes[i], return_sequences=True, stateful=False, name=f"{name}_GRU_{i}", return_state=return_state))
+            else:
+                assert "rnn cell must be either LSTM or GRU"
+
+        # stacking CNN layers
+        for i in range(len(deconv_out_channels)):
+            self.deconv_layers.append(tf.keras.layers.Conv1DTranspose(filters=deconv_out_channels[i], 
+                                                      kernel_size=deconv_kernel_sizes[i], 
+                                                      strides=deconv_strides[i],
+                                                      padding="same", 
+                                                      output_padding=deconv_output_padding[i],
+                                                      activation=deconv_activations[i],
+                                                      dtype=tf.float32))
+
+
+        if len(out_fc_sizes) >= 1:
+            for i in range(len(out_fc_sizes)):
+                self.out_fc_layers.append(tf.keras.layers.Dense(units=out_fc_sizes[i] ,dtype=tf.float32, activation=out_fc_activations[i], name=f"{name}_dense_{i}"))
+            
+                        
+    
+    def call(self,inputs,states=None):
+        if states is not None:
+            assert len(states) == len(self.rnn_layers), "every rnn layer must have an initial state"
+        x = inputs
+        
+        for i in range(len(self.deconv_layers)):
+            x = self.deconv_layers[i](x)
+
+        # forward pass through the rnn layers
+        final_states = []
+        for i in range(len(self.rnn_layers)):
+            if self.return_state:
+                if states is not None:
+                    init_state = tf.stop_gradient(tf.identity(states[i]))
+                    x, final_state = self.rnn_layers[i](inputs=x,initial_state=init_state)
+                else:
+                    x, final_state = self.rnn_layers[i](inputs=x)
+                final_states.append(final_state)
+            else:
+                x = self.rnn_layers[i](x)
+
+        for i in range(len(self.out_fc_layers)):
+            x = self.out_fc_layers[i](x)
+
+        
+        
+        if self.return_state:
+            return x,final_states
+        else:
+            return x
+
+    def model(self):
+        x = tf.keras.Input(shape=self.input_size, batch_size=self.batch_size)
+        return tf.keras.Model(inputs=[x], outputs=self.call(x))
+
 
 class cnn_decoder(tf.keras.Model):
     def __init__(self, conv_out_channels, kernel_sizes):
@@ -398,22 +691,27 @@ class ImagePreprocessor(tf.keras.Model):
 class VAE(tf.keras.Model):
     def __init__(self, latent_dim, data_dim, time_length,
                  encoder,
-                 decoder, beta=1.0, M=1, K=1, retain_enc_state=False, retain_dec_state=False, **kwargs):
-        """ Basic Variational Autoencoder with Standard Normal prior
+                 decoder, beta=1.0, M=1, K=1, retain_enc_state=False, retain_dec_state=False, latent_space_time_length_down_sample_ratio=1, 
+                 **kwargs):
+        """ 
+        Basic Variational Autoencoder with Standard Normal prior
             :param latent_dim: latent space dimensionality
             :param data_dim: original data dimensionality
             :param time_length: time series duration
-            :param encoder: encoder model class {Diagonal, Joint, BandedJoint}Encoder
-            :param decoder: decoder model class {Bernoulli, Gaussian}Decoder
+            :param encoder: encoder model class
+            :param decoder: decoder model class
             
             :param beta: tradeoff coefficient between reconstruction and KL terms in ELBO
             :param M: number of Monte Carlo samples for ELBO estimation
             :param K: number of importance weights for IWAE model (see: https://arxiv.org/abs/1509.00519)
+
         """
         super(VAE, self).__init__()
         self.latent_dim = latent_dim
         self.data_dim = data_dim
         self.time_length = time_length
+        self.down_sample_ratio = latent_space_time_length_down_sample_ratio
+        self.latent_space_time_length = time_length//latent_space_time_length_down_sample_ratio
         self.encoder = encoder
         self.decoder = decoder
         self.beta = beta
@@ -422,12 +720,14 @@ class VAE(tf.keras.Model):
         self.M = M
         self.retain_enc_state = retain_enc_state
         self.retain_dec_state = retain_dec_state
-        self.encoder_final_state = None
-        self.decoder_final_state = None
+        self.encoder_state = None
+        self.decoder_state = None
+        
+
     def encode(self, x, states=None):
         x = tf.identity(x)  # in case x is not a Tensor already...
         if self.retain_enc_state:
-            enc_out,self.encoder_final_state = self.encoder(x,states=states)
+            enc_out,self.encoder_state = self.encoder(x,states=self.encoder_state)
         else:
             enc_out = self.encoder(x)
         return enc_out
@@ -435,7 +735,7 @@ class VAE(tf.keras.Model):
     def decode(self, z, states=None):
         z = tf.identity(z)  # in case z is not a Tensor already...
         if self.retain_dec_state:
-            dec_out, self.decoder_final_state = self.decoder(z,states=states)
+            dec_out, self.decoder_state = self.decoder(z,states=self.decoder_state)
         else:
             dec_out = self.decoder(z)
         return dec_out
@@ -444,23 +744,52 @@ class VAE(tf.keras.Model):
         return self.decode(self.encode(inputs).sample()).sample()
         #return self.decode(self.encode(inputs).sample()).mean()
 
-    def reset_enc_dec_states(self):
-        self.encoder_final_state = None
-        self.decoder_final_state = None
+    def reset_states(self):
+        self.encoder_state = None
+        self.decoder_state = None
 
 
-    def reconstruct(self, x, enc_stateful=False, dec_stateful=False):
-        enc_state = None
-        dec_state = None
-        if enc_stateful:
-            enc_state = self.encoder_final_state
-        z = self.encode(x,enc_state)
-        z_mean = z.mean()
-        if dec_stateful:
-            dec_state = self.encoder_final_state
-        x_hat = self.decode(z_mean,dec_state)
-        x_hat_mean = x_hat.mean()
-        return x_hat_mean
+    def reconstruct(self, x, return_z_mean=False):
+        pz = self.prior
+        qz_x = self.encode(x)
+        z_mean = qz_x.mean()
+        
+        px_z = self.decode(z_mean)
+        x_hat = px_z.mean()
+        # since we already have all the components, compute the KL divergence
+        kl = self.kl_divergence(qz_x, pz)
+        kl = tf.where(tf.math.is_finite(kl), kl, tf.zeros_like(kl))
+        # sum the KL over all latent dimensions. we're left with the KL term per window in the batch
+        kl = tf.expand_dims(tf.reduce_sum(kl, 1),axis=1)
+        if return_z_mean:
+            return x_hat, kl, z_mean
+        else:
+            return x_hat, kl
+
+
+    def compute_observation_loss(self,x):
+        assert len(x.shape) == 3, "Input should have shape: [batch_size, time_length, data_dim]"
+        # in case x is not a Tensor already...
+        x = tf.identity(x)
+        pz = self._get_prior()
+        qz_x = self.encode(x)
+        z = qz_x.sample()
+        px_z = self.decode(z)
+        # get the negative log-likelihood. shape=(batch_size, seq_len, data_dim)
+        nll = -px_z.log_prob(x)  
+        nll = tf.where(tf.math.is_finite(nll), nll, tf.zeros_like(nll))
+        # sum the nll over the data dimension
+        nll = tf.reduce_sum(nll, 2)
+        # compute the KL divergence
+        kl = self.kl_divergence(qz_x, pz)
+        kl = tf.where(tf.math.is_finite(kl), kl, tf.zeros_like(kl))
+        # sum the KL over all latent dimensions. we're left with the KL term per window in the batch
+        kl = tf.expand_dims(tf.reduce_sum(kl, 1),axis=1)
+
+        elbo = -nll - self.beta * kl
+        return -elbo
+        
+
 
 
     def generate(self, noise=None, num_samples=1):
@@ -536,6 +865,7 @@ class VAE(tf.keras.Model):
             elbo = tf.reduce_mean(elbo)  # scalar
         else:
             # if K==1, compute KL analytically
+
             kl = self.kl_divergence(qz_x, pz)  # shape=(M*K*BS, TL or d)
             kl = tf.where(tf.math.is_finite(kl), kl, tf.zeros_like(kl))
             kl = tf.reduce_sum(kl, 1)  # shape=(M*K*BS)
@@ -561,6 +891,196 @@ class VAE(tf.keras.Model):
         self.compute_loss(tf.random.normal(shape=(1, self.time_length, self.data_dim), dtype=tf.float32),
                           tf.zeros(shape=(1, self.time_length, self.data_dim), dtype=tf.float32))
         return self.trainable_variables
+
+
+class gpdir_vae(VAE):
+    def __init__(self, 
+                 normal_latent_dim,
+                 dirichlet_latent_dim,
+                 data_dim, 
+                 time_length,
+                 encoder,
+                 decoder, 
+                 beta=1.0, 
+                 retain_enc_state=False, 
+                 retain_dec_state=False, 
+                 latent_space_time_length_down_sample_ratio=1, 
+                 kernel="cauchy", 
+                 sigma=1., 
+                 length_scale=1.0, 
+                 kernel_scales=1,
+                 dirichlet_prior_alphas=None,
+                 *args, 
+                 **kwargs):
+        # normal prior constants
+        self.kernel = kernel
+        self.sigma = sigma
+        self.length_scale = length_scale
+        self.kernel_scales = kernel_scales
+        # dirichlet prior constants
+        if dirichlet_prior_alphas is None:
+            self.dirichlet_prior_alphas = tf.ones(dirichlet_latent_dim)
+        else:
+            self.dirichlet_prior_alphas = dirichlet_prior_alphas
+        # init the priors to None. They will be determined on the first call to the loss function
+        self.normal_prior = None
+        self.dirichlet_prior = None
+        self.normal_latent_dim = normal_latent_dim
+        self.dirichlet_latent_dim = dirichlet_latent_dim
+        super(gpdir_vae, self).__init__(latent_dim=normal_latent_dim, 
+                                        data_dim=data_dim, 
+                                        time_length=time_length,
+                                        encoder=encoder,
+                                        decoder=decoder, 
+                                        beta=beta, 
+                                        retain_enc_state=retain_enc_state, 
+                                        retain_dec_state=retain_dec_state, 
+                                        latent_space_time_length_down_sample_ratio=latent_space_time_length_down_sample_ratio)
+        
+    
+
+    def encode(self, x):
+        x = tf.identity(x)
+        if self.retain_enc_state:
+            dirichlet_dist, normal_dist, self.encoder_state = self.encoder(x,states=self.encoder_state)
+        else:
+            dirichlet_dist, normal_dist = self.encoder(x)
+        return dirichlet_dist, normal_dist
+
+    def decode(self, z):
+        num_dim = len(z.shape)
+        assert num_dim == 3, "In VAE decode, number of Z dimensions must equal 3"
+        # the obtained z sample is of shape [batch_size, z_dim, seq_len]. transpose it to [batch_size, seq_len, z_dim]
+        zt = tf.transpose(z, perm=[0,2,1])
+        if self.retain_dec_state:
+            dec_out, self.decoder_state = self.decoder(zt,states=self.decoder_state)
+        else:
+            dec_out = self.decoder(zt)
+        return dec_out
+
+        
+    def sample_z(self, dirichlet_dist, normal_dist, return_mean=False):
+        # sample from the normal vectors in the latent space - this sample has shape [batch_size, gz_dim, latent_dim_seq_len]
+        if return_mean:
+            z_normal = normal_dist.mean()
+        else:
+            z_normal = normal_dist.sample()
+
+        # sample from the dirichlet distribution in the latent space - this sample has shape [batch_size, dz_dim]
+        if return_mean:
+            z_dir = dirichlet_dist.mean()
+        else:
+            z_dir = dirichlet_dist.sample()
+
+        # the shape of the dirichlet sample is [batch_size,dz_dim]. Add a dimension and transpose it to have the Z dimension on axis 1 (just like the sampled normal vectors)
+        z_dir = tf.expand_dims(z_dir,axis=1)
+        z_dir = tf.transpose(z_dir,perm=[0,2,1])       
+        
+        # the dirichlet representation is not per time point, but for the entire window. repeat the sample for every temporal point
+        z_dir = tf.repeat(z_dir, repeats=z_normal.shape[2], axis=2)
+
+        # concatenate both representations along the z axis
+        z = tf.concat([z_normal, z_dir], axis=1)
+
+        return z
+
+
+    def __call__(self, inputs):
+
+        q_zd_x, q_zn_x = self.encode(x)
+        z = self.sample_z(q_zd_x, q_zn_x)
+        px_z = self.decode(z)
+        return px_z.sample()
+
+    def reconstruct(self, x, return_z_mean=False):
+        q_zd_x, q_zn_x = self.encode(x)
+        z_mean = self.sample_z(q_zd_x, q_zn_x, return_mean=True)
+        
+        px_z = self.decode(z_mean)
+        x_hat = px_z.mean()
+        # since we already have all the components, compute the KL divergence
+        kl_n = tf.reduce_sum(self.kl_divergence(q_zn_x, self._get_normal_prior()), 1)
+        kl_d = self.kl_divergence(q_zd_x, self._get_dirichlet_prior())
+        kl = tf.expand_dims(kl_n + kl_d, axis=1)
+        if return_z_mean:
+            return x_hat, kl, z_mean
+        else:
+            return x_hat, kl
+
+    def _compute_loss(self, x, m_mask=None, return_parts=False):
+        x = tf.identity(x)
+        assert len(x.shape) == 3, "Input should have shape: [batch_size, time_length, data_dim]"
+        q_zd_x, q_zn_x = self.encode(x)
+        z = self.sample_z(q_zd_x, q_zn_x)
+        px_z = self.decode(z)
+        # compute the negative log likelihood. shape=(batch_size, seq_len, data_dim)
+        nll = -px_z.log_prob(x)
+        nll = tf.where(tf.math.is_finite(nll), nll, tf.zeros_like(nll))
+        # if not HI-VAE, m_mask is always zeros
+        if m_mask is not None:
+            nll = tf.where(m_mask, tf.zeros_like(nll), nll)
+        # sum the NLL along the time and channels (data features) dimensions. remain with shape [batch_size,1]
+        nll = tf.reduce_sum(nll, [1, 2])
+
+        
+        # compute the normal part KL divergence. shape is [batch_size, gz_dim] (gz_dim is the normal latent space dimension)
+        p_zn = self._get_normal_prior()
+        kl_n = tf.reduce_sum(self.kl_divergence(q_zn_x, p_zn), 1)
+        # compute the dirichlet part KL divergence. shape is [batch_size, 1]
+        p_zd = self._get_dirichlet_prior()
+        kl_d = self.kl_divergence(q_zd_x, p_zd)
+
+        elbo = -nll - self.beta * (kl_n + kl_d)
+        elbo = tf.reduce_mean(elbo)
+
+        if return_parts:
+            nll = tf.reduce_mean(nll)
+            kl = tf.reduce_mean(kl_n + kl_d)
+            return -elbo, nll, kl
+        else:
+            return -elbo
+
+    def kl_divergence(self, posterior, prior):
+        kl = tfd.kl_divergence(posterior, prior)
+        # replace Nan values with zeros
+        kl = tf.where(tf.math.is_finite(kl), kl, tf.zeros_like(kl))
+        
+        return kl
+
+    def _get_dirichlet_prior(self):
+        if self.dirichlet_prior is None:
+            self.dirichlet_prior = tfd.Dirichlet(self.dirichlet_prior_alphas)
+        return self.dirichlet_prior
+
+    def _get_normal_prior(self):
+        if self.normal_prior is None:
+            # Compute kernel matrices for each latent dimension
+            kernel_matrices = []
+            for i in range(self.kernel_scales):
+                if self.kernel == "rbf":
+                    kernel_matrices.append(rbf_kernel(self.latent_space_time_length, self.length_scale / 2**i))
+                elif self.kernel == "diffusion":
+                    kernel_matrices.append(diffusion_kernel(self.latent_space_time_length, self.length_scale / 2**i))
+                elif self.kernel == "matern":
+                    kernel_matrices.append(matern_kernel(self.latent_space_time_length, self.length_scale / 2**i))
+                elif self.kernel == "cauchy":
+                    kernel_matrices.append(cauchy_kernel(self.latent_space_time_length, self.sigma, self.length_scale / 2**i))
+
+            # Combine kernel matrices for each latent dimension
+            tiled_matrices = []
+            total = 0
+            for i in range(self.kernel_scales):
+                if i == self.kernel_scales-1:
+                    multiplier = self.normal_latent_dim - total
+                else:
+                    multiplier = int(np.ceil(self.normal_latent_dim / self.kernel_scales))
+                    total += multiplier
+                tiled_matrices.append(tf.tile(tf.expand_dims(kernel_matrices[i], 0), [multiplier, 1, 1]))
+            kernel_matrix_tiled = np.concatenate(tiled_matrices)
+            assert len(kernel_matrix_tiled) == self.normal_latent_dim
+            prior_mean = tf.zeros([self.normal_latent_dim, self.latent_space_time_length], dtype=tf.float32)
+            self.normal_prior = tfd.MultivariateNormalTriL(loc=prior_mean, scale_tril=tf.linalg.cholesky(kernel_matrix_tiled))
+        return self.normal_prior
 
 
 class HI_VAE(VAE):
@@ -593,9 +1113,9 @@ class GP_VAE(HI_VAE):
 
     def decode(self, z, states=None):
         num_dim = len(z.shape)
-        assert num_dim > 2
-        perm = list(range(num_dim - 2)) + [num_dim - 1, num_dim - 2]
-        zt = tf.transpose(z, perm=perm)
+        assert num_dim == 3, "In VAE decode, number of Z dimensions must equal 3"
+        # the obtained z sample is of shape [batch_size, z_dim, seq_len]. transpose it to [batch_size, seq_len, z_dim]
+        zt = tf.transpose(z, perm=[0,2,1])
         if self.retain_dec_state:
             dec_out, self.decoder_final_state = self.decoder(zt,states=states)
         else:
@@ -608,13 +1128,13 @@ class GP_VAE(HI_VAE):
             kernel_matrices = []
             for i in range(self.kernel_scales):
                 if self.kernel == "rbf":
-                    kernel_matrices.append(rbf_kernel(self.time_length, self.length_scale / 2**i))
+                    kernel_matrices.append(rbf_kernel(self.latent_space_time_length, self.length_scale / 2**i))
                 elif self.kernel == "diffusion":
-                    kernel_matrices.append(diffusion_kernel(self.time_length, self.length_scale / 2**i))
+                    kernel_matrices.append(diffusion_kernel(self.latent_space_time_length, self.length_scale / 2**i))
                 elif self.kernel == "matern":
-                    kernel_matrices.append(matern_kernel(self.time_length, self.length_scale / 2**i))
+                    kernel_matrices.append(matern_kernel(self.latent_space_time_length, self.length_scale / 2**i))
                 elif self.kernel == "cauchy":
-                    kernel_matrices.append(cauchy_kernel(self.time_length, self.sigma, self.length_scale / 2**i))
+                    kernel_matrices.append(cauchy_kernel(self.latent_space_time_length, self.sigma, self.length_scale / 2**i))
 
             # Combine kernel matrices for each latent dimension
             tiled_matrices = []
@@ -630,10 +1150,10 @@ class GP_VAE(HI_VAE):
             assert len(kernel_matrix_tiled) == self.latent_dim
 
             self.prior = tfd.MultivariateNormalFullCovariance(
-                loc=tf.zeros([self.latent_dim, self.time_length], dtype=tf.float32),
+                loc=tf.zeros([self.latent_dim, self.latent_space_time_length], dtype=tf.float32),
                 covariance_matrix=kernel_matrix_tiled)
         return self.prior
-
+    '''
     def kl_divergence(self, a, b):
         """ Batched KL divergence `KL(a || b)` for multivariate Normals.
             See https://github.com/tensorflow/probability/blob/master/tensorflow_probability
@@ -678,3 +1198,4 @@ class GP_VAE(HI_VAE):
                       squared_frobenius_norm(b_inv_a) + squared_frobenius_norm(
                       b.scale.solve((b.mean() - a.mean())[..., tf.newaxis]))))
         return kl_div
+    '''

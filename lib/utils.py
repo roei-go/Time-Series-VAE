@@ -3,6 +3,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 from sklearn.linear_model import LogisticRegression
+from sklearn.manifold import TSNE
 import numpy as np
 import matplotlib
 from matplotlib import pyplot as plt
@@ -269,7 +270,7 @@ def prepare_data_for_imputation_experiment(series, window_size, percent_missing 
     else:
         return full_data_train, full_data_val, full_data_test, miss_data_train, miss_data_val, miss_data_test, mask_train, mask_val, mask_test
 
-def train_loop(model, num_epochs, train_ds, val_ds, optimizer, checkpoint, checkpoint_prefix, gradient_clip=1e3,log_every=10, verbose=False, train_for_imputation = True):
+def train_loop(model, num_epochs, train_ds, val_ds, optimizer, checkpoint, checkpoint_prefix, gradient_clip=1e3,log_every=10, verbose=False, train_for_imputation = True, use_sequential_ds=False, batch_size_low=32, batch_size_high=64):
     trainable_vars = model.get_trainable_vars()
     losses_train = []
     kl_term_train = []
@@ -277,103 +278,26 @@ def train_loop(model, num_epochs, train_ds, val_ds, optimizer, checkpoint, check
     train_mse = []
     val_mse_list = []
     min_val_mse = np.inf
-    num_batches = len(train_ds)
-    for epoch in range(num_epochs):
-        acc_elbo = 0
-        acc_kl = 0
-        acc_nll = 0
-        # Iterate over the batches of the dataset.
-        for step, batch in enumerate(train_ds):
-            if train_for_imputation:
-                (x_gt_seq, x_seq, m_seq) = batch
-            else:
-                x_seq = batch
-                m_seq = None
-            # Open a GradientTape to record the operations run
-            # during the forward pass, which enables auto-differentiation.
-            with tf.GradientTape() as tape:
-                # Ensures that the trainable parameters are being traced by this tape.
-                tape.watch(trainable_vars)
-                # compute the loss for this batch - this include also a forward pass in the model
-                loss, nll, kl = model.compute_loss(x_seq, m_mask=m_seq, return_parts=True)
-                
-            # Use the gradient tape to automatically retrieve the gradients of the trainable variables with respect to the loss.
-            grads = tape.gradient(loss, trainable_vars)
-            grads = [np.nan_to_num(grad) for grad in grads]
-            grads, global_norm = tf.clip_by_global_norm(grads, gradient_clip)
-            # Run one step of gradient descent by updating the value of the variables to minimize the loss.
-            optimizer.apply_gradients(zip(grads, trainable_vars))
-            acc_elbo += loss.numpy()
-            acc_kl += kl.numpy()
-            acc_nll += nll.numpy()
-            losses_train.append(loss.numpy())
-            kl_term_train.append(kl.numpy())
-            nll_train.append(nll.numpy())
-            # Log every n batches.
-            if step % log_every == 0:
-                train_batch_mse = None
-                val_mse = None
-                if train_for_imputation:
-                    n_missings = tf.math.reduce_sum(m_seq)
-                    train_batch_mse = model.compute_mse(x=x_seq, y=x_gt_seq, m_mask=m_seq) / n_missings
-                    train_mse.append(train_batch_mse)
-                
-                if train_for_imputation and val_ds is not None :
-                    # calculate the validation MSE
-                    val_missing = 0
-                    val_missing_sq_error = 0
-                    for (val_gt_seq, val_miss_seq, val_mask_seq) in val_ds:
-                        # update the number of missing values in the validation set
-                        val_missing += tf.math.reduce_sum(val_mask_seq).numpy()
-                        val_missing_sq_error += model.compute_mse(x=val_miss_seq, y=val_gt_seq, m_mask=val_mask_seq).numpy()
-                    val_mse = val_missing_sq_error/val_missing
-                    
-                    val_mse_list.append(val_mse)
-                    if val_mse < min_val_mse:
-                        min_val_mse = val_mse
-                        checkpoint.write(checkpoint_prefix)
-                if verbose:
-                    print("Training loss (for one batch) at step %d: %.4f" % (step, float(loss.numpy())))
-                    if train_batch_mse is not None: print("Training MSE (for one batch) at step %d: %.4f" % (step, train_batch_mse))
-                    if val_mse is not None: print(f"Validation MSE is {val_mse}")
-        print(f"in epoch {epoch+1} mean elbo is {acc_elbo/num_batches}")
-        print(f"in epoch {epoch+1} mean kl is {acc_kl/num_batches}")
-        print(f"in epoch {epoch+1} mean nll is {acc_nll/num_batches}")
-        print("-------------------------------------------------------------------------------------")
-    return losses_train, kl_term_train, nll_train, train_mse, val_mse_list
-
-
-
-
-def train_loop_sampler(model, data, seq_len, batch_size, num_epochs, trainable_vars, optimizer, checkpoint, checkpoint_prefix, gradient_clip=1e3,log_every=10, verbose=False, train_for_imputation = True):
-    
-    losses_train = []
-    kl_term_train = []
-    nll_train = []
-    train_mse = []
-    val_mse_list = []
-    min_val_mse = np.inf
     
     for epoch in range(num_epochs):
         acc_elbo = 0
         acc_kl = 0
         acc_nll = 0
-        model.encoder.net.net.layers[0].reset_states()
-        model.decoder.net.net.layers[0].reset_states()
+        model.reset_states()
+        if use_sequential_ds:
+            batch_size = np.random.randint(low=batch_size_low,high=batch_size_high)
+            train_ds.pick_data(batch_size)
+            iterator = train_ds.iterator()
+        else:
+            iterator = train_ds
         # Iterate over the batches of the dataset.
-        sampler = sequence_sampler(data, seq_len, batch_size)
-        
-        for step, batch in enumerate(sampler.iterator()):
+        for step, batch in enumerate(iterator):
             if train_for_imputation:
                 (x_gt_seq, x_seq, m_seq) = batch
             else:
                 x_seq = batch
                 m_seq = None
-            if step % 4 == 0:
-                model.encoder.net.net.reset_states()
-                model.decoder.net.net.reset_states()
-            # Open a GradientTape to record the operations run
-            # during the forward pass, which enables auto-differentiation.
+            # Open a GradientTape to record the operations run during the forward pass, which enables auto-differentiation.
             with tf.GradientTape() as tape:
                 # Ensures that the trainable parameters are being traced by this tape.
                 tape.watch(trainable_vars)
@@ -426,6 +350,10 @@ def train_loop_sampler(model, data, seq_len, batch_size, num_epochs, trainable_v
     return losses_train, kl_term_train, nll_train, train_mse, val_mse_list
 
 
+
+
+
+
 def calculate_f1(labels,tpr,fpr,thresholds):
     assert tpr.shape == fpr.shape, "tpr & fpr must have the same shape"
     # find thresholds for which tpr & fpr are both zeros
@@ -450,89 +378,156 @@ def calculate_f1(labels,tpr,fpr,thresholds):
     return f1, recall, precision, thresholds
 
 
-def get_reconstruction_error(model, data, labels, seq_len, stateful_encoder=False,stateful_decoder=False):
+def get_reconstruction(model, data, labels, seq_len, batch_size=32, return_z_mean=False):
 
-    # first, truncate the data size (in time domain) such that the number of samples in an integer multiple of the window size
-    print(f"slicing the series data to windows len {seq_len}")
-    new_size = data.shape[0] - (data.shape[0] % seq_len)
-    data_reshaped = data[:new_size,:]
-    # extract the labels corresponding to the data we kept
-    labels = labels[:new_size]
-    # reshape the data 
-    data_reshaped = np.reshape(data_reshaped,(new_size//seq_len,seq_len,data_reshaped.shape[1]))
-    print("orig data shape is ",data.shape)
-    print("new data shape is " ,data_reshaped.shape)
-
-    
-    if stateful_encoder:
+    if model.retain_enc_state or model.retain_dec_state:
+        # truncate the data size (in time domain) such that the number of samples in an integer multiple of (seq_len*batch_size)
+        new_size = data.shape[0] - (data.shape[0] % (seq_len*batch_size))
+        data = data[:new_size,:]
+        labels = labels[:new_size]
+        print(f"slicing the series data to sub-sequences with length {new_size/batch_size}")
+        sampler = sequence_sampler(data=data,seq_len=seq_len,batch_size=batch_size)
+        sampler.pick_data(batch_size)
+        print(f"number of batches in the sampler is {sampler.num_batches}")
+        iterator = sampler.iterator()
         # reset the model's internal states
-        model.reset_enc_dec_states()
-        data_ds = tf.data.Dataset.from_tensor_slices(data_reshaped).batch(1)
-    else:
-        data_ds = tf.data.Dataset.from_tensor_slices(data_reshaped).batch(32)
+        model.reset_states()
         
-    # reconstruct using the trained model
+    else:
+        # truncate the data size (in time domain) such that the number of samples in an integer multiple of the window size
+        print(f"slicing the series data to windows len {seq_len}")
+        new_size = data.shape[0] - (data.shape[0] % seq_len)
+        data = data[:new_size,:]
+        # extract the labels corresponding to the data we kept
+        labels = labels[:new_size]
+        # reshape the data 
+        data_reshaped = np.reshape(data,(new_size//seq_len,seq_len,data.shape[1]))
+        print("orig data shape is ",data.shape)
+        print("new data shape is " ,data_reshaped.shape)
+        iterator = tf.data.Dataset.from_tensor_slices(data_reshaped).batch(batch_size)
+       
+    # using the trained model, reconstruct the data, and for each window get the KL term as well
     data_reconstructed_batches = []
-    for batch_idx, batch in enumerate(data_ds):
-        data_reconstructed_batches.append(model.reconstruct(x=batch,enc_stateful=stateful_encoder, dec_stateful=stateful_decoder).numpy())
+    kl_batches = []
+    z_mean_batches = []
+    for batch_idx, batch in enumerate(iterator):
+        if return_z_mean:
+            x_hat, kl, z_mean = model.reconstruct(x=batch, return_z_mean=True)
+            # z_mean shape is [batch_size, z_dim, latent_space_seq_len]. transpose to [batch_size, latent_space_seq_len, z_dim]
+            z_mean = tf.transpose(z_mean, perm=[0,2,1])
+            # each latent space sample generates n samples in the data space. 
+            # z_mean = tf.repeat(z_mean,repeats=seq_len//model.latent_space_time_length, axis=1)
+            z_mean_batches.append(z_mean.numpy())
+        else:
+            x_hat, kl = model.reconstruct(x=batch)
+        data_reconstructed_batches.append(x_hat.numpy())
+        # we have a single KL term for each window in the batch. repeat it seq_len times such that each time point will have that term
+        kl = np.repeat(kl.numpy(), seq_len, axis=1)
+        kl_batches.append(kl)
 
-    # concatenate the batches to obtain a long and chronologically ordered array of windows
-    data_reconstructed = np.concatenate(data_reconstructed_batches)
+    if model.retain_enc_state or model.retain_dec_state:
+        # concatenate the batches along the time axis
+        data_reconstructed = np.concatenate(data_reconstructed_batches,axis=1)
+        kl = np.concatenate(kl_batches,axis=1)
+        if len(z_mean_batches) > 0:
+            z_mean = np.concatenate(z_mean_batches,axis=1)
+
+    else:
+        # concatenate the batches to obtain a long and chronologically ordered array of windows
+        data_reconstructed = np.concatenate(data_reconstructed_batches)
+        kl = np.concatenate(kl_batches)
+        if len(z_mean_batches) > 0:
+            z_mean = np.concatenate(z_mean_batches)
 
     # reshape the original and reconstructed data
-    print("reshaping the original data and reconstructed data to the original shapes")
+    print("reshaping the reconstructed data to the original shapes")
     data_reconstructed = np.reshape(data_reconstructed, (data_reconstructed.shape[0]*data_reconstructed.shape[1],data_reconstructed.shape[2]))
-    data_orig          = np.reshape(data_reshaped     , (data_reshaped.shape[0]*data_reshaped.shape[1],data_reshaped.shape[2]))
+    kl_reconstructed = np.reshape(kl, (kl.shape[0]*kl.shape[1],))
     print("data_reconstructed.shape = ",data_reconstructed.shape)
-    print("data_orig.shape = ",data_orig.shape)
+    print("kl_reconstructed.shape = ",kl_reconstructed.shape)
+    print("data_orig.shape = ",data.shape)
+    if return_z_mean:
+        z_mean = np.reshape(z_mean, (z_mean.shape[0]*z_mean.shape[1],z_mean.shape[2]))
+        print("z_mean.shape = ", z_mean.shape)
+        return data, data_reconstructed, kl_reconstructed, labels, z_mean
+    else:
+        return data, data_reconstructed, kl_reconstructed, labels
+
+
+def get_reconstruction_error(model, data, labels, seq_len, batch_size=32, stateful_encoder=False,stateful_decoder=False):
+
+    data, data_reconstructed, kl_reconstructed, labels = get_reconstruction(model, data, labels, seq_len, batch_size=batch_size)
     # calculate the reconstruction MSE
     print("calculating reconstruction MSE")
-    reconstruct_error = np.linalg.norm(data_reconstructed-data_orig,axis=1)
+    reconstruct_error = np.linalg.norm(data_reconstructed-data,axis=1)
     print("reconstruct_error.shape = ", reconstruct_error.shape)
 
     fpr, tpr, thresholds = roc_curve(y_true=labels, y_score=reconstruct_error/np.max(reconstruct_error))
-    fpr = np.flip(fpr)
-    tpr = np.flip(tpr)
-    thresholds = np.flip(thresholds)
     auc = roc_auc_score(y_true=labels, y_score=reconstruct_error/np.max(reconstruct_error))
-    print(f"AUC is {auc}")
+    print(f"reconstruction error based AUC is {auc}")
+
+    
+    recons_plus_kl = reconstruct_error + kl_reconstructed
+    recons_plus_kl_fpr, recons_plus_kl_tpr, recons_plus_kl_thresholds = roc_curve(y_true=labels, y_score=recons_plus_kl/np.max(recons_plus_kl))
+    recons_plus_kl_auc = roc_auc_score(y_true=labels, y_score=recons_plus_kl/np.max(recons_plus_kl))
+    print(f"reconst error plus KL based AUC is {recons_plus_kl_auc}")
+
+
     # separate the reconstruction errors of the "normal" measurements and the "abnormal" ones
-    normal_labels_idx = np.nonzero(labels == 0)
-    normal_reconst_error = reconstruct_error[normal_labels_idx]
+    normal_labels_idx   = np.nonzero(labels == 0)
     abnormal_labels_idx = np.nonzero(labels == 1)
+    normal_reconst_error   = reconstruct_error[normal_labels_idx]
     abnormal_reconst_error = reconstruct_error[abnormal_labels_idx]
+
+    normal_reconst_error_plus_kl   = recons_plus_kl[normal_labels_idx]
+    abnormal_reconst_error_plus_kl = recons_plus_kl[abnormal_labels_idx]
     
     f1, recall, precision, thresholds = calculate_f1(labels,tpr,fpr,thresholds)
     max_f1 = np.max(f1)
     print(f"F1 max is {max_f1}")
-    fig,ax = plt.subplots(figsize=(6,6))
-    ax.hist(normal_reconst_error,bins=100,label="normal")
-    ax.hist(abnormal_reconst_error,bins=100,label="abnormal")
-    ax.legend()
-    ax.set_xlabel('error magnitude')
-    ax.set_ylabel('count')
-    ax.set_title(f"reconstruction errors histograms")
+    f1_with_kl, _, _, _ = calculate_f1(labels,recons_plus_kl_tpr,recons_plus_kl_fpr,recons_plus_kl_thresholds)
+    print(f"with KL term, F1 max is {np.max(f1_with_kl)}")
+    fig,ax = plt.subplots(1,2,figsize=(12,6))
+    ax[0].hist(normal_reconst_error,bins=100,label="normal")
+    ax[0].hist(abnormal_reconst_error,bins=100,label="anomaly")
+    ax[0].legend()
+    ax[0].set_xlabel('error magnitude')
+    ax[0].set_ylabel('count')
+    ax[0].set_title(f"reconstruction errors histograms")
+
+    ax[1].hist(normal_reconst_error_plus_kl,bins=100,label="normal")
+    ax[1].hist(abnormal_reconst_error_plus_kl,bins=100,label="anomaly")
+    ax[1].legend()
+    ax[1].set_xlabel('error magnitude')
+    ax[1].set_ylabel('count')
+    ax[1].set_title(f"reconstruction errors plus KL term histograms")
     plt.show()
     fig,ax = plt.subplots(1,2,figsize=(12,6))
-    ax[0].plot(fpr,tpr)
+    ax[0].plot(fpr,tpr,label="reconstruction based")
+    ax[0].plot(recons_plus_kl_fpr,recons_plus_kl_tpr,label="with KL")
     ax[0].set_xlabel('fpr')
     ax[0].set_ylabel('tpr')
-    ax[0].set_title(f"ROC curve for SWAT anomaly detection")
+    ax[0].set_title(f"ROC curve for anomaly detection")
+    ax[0].legend()
     ax[1].plot(thresholds,recall,label='recall')
     ax[1].plot(thresholds,precision,label='precision')
     ax[1].set_xlabel('thresholds')
     ax[1].set_ylabel('prec/recall')
-    ax[1].set_title(f"precision and recall for swat anomaly detection")
+    ax[1].set_title(f"precision and recall for anomaly detection")
     ax[1].legend()
     plt.show()
-    results_dict = {'fpr' : fpr, 
-                    'tpr' : tpr, 
-                    'thresholds' : thresholds, 
-                    'auc' : auc, 
-                    'max_f1' : max_f1, 
-                    'recall' : recall, 
-                    'precision' : precision, 
-                    'reconstruct_error' : reconstruct_error}
+    results_dict = {'fpr'                       : fpr, 
+                    'tpr'                       : tpr, 
+                    'thresholds'                : thresholds, 
+                    'auc'                       : auc, 
+                    'recons_plus_kl_fpr'        : recons_plus_kl_fpr, 
+                    'recons_plus_kl_tpr'        : recons_plus_kl_tpr, 
+                    'recons_plus_kl_thresholds' : recons_plus_kl_thresholds, 
+                    'recons_plus_kl_auc'        : recons_plus_kl_auc, 
+                    'max_f1'                    : max_f1, 
+                    'recall'                    : recall, 
+                    'precision'                 : precision, 
+                    'reconstruct_error'         : reconstruct_error}
     return results_dict
 
 def observe_latent_variables_means_distributions(means,labels):
@@ -553,38 +548,31 @@ def observe_latent_variables_means_distributions(means,labels):
         ax.set_title(f"latent variable z_{i} means histograms")
         plt.show()
 
-def get_latent_variables_means(model, data, labels, seq_len, time_axis=1, latent_axis=2, stateful_encoder=False):
-    # first, truncate the data size (in time domain) such that the number of samples in an integer multiple of the window size
-    print(f"slicing the series data to windows len {seq_len}")
-    new_size = data.shape[0] - (data.shape[0] % seq_len)
-    data_reshaped = data[:new_size,:]
-    # extract the labels corresponding to the data we kept
-    labels = labels[:new_size]
-    # reshape the data 
-    data_reshaped = np.reshape(data_reshaped,(new_size//seq_len,seq_len,data_reshaped.shape[1]))
-    print("orig data shape is ",data.shape)
-    print("new data shape is " ,data_reshaped.shape)
+def embed_latent_representation(z_mean, labels, sample_size, z_splits, titles):
 
+    if sample_size < z_mean.shape[0]:
+        smpl_idx = np.random.choice(np.arange(z_mean.shape[0]), size=sample_size, replace=False)
+        z_mean = z_mean[smpl_idx,:]
+        labels = labels[smpl_idx]
     
-    if stateful_encoder:
-        # reset the model's internal states
-        model.reset_enc_dec_states()
-        data_ds = tf.data.Dataset.from_tensor_slices(data_reshaped).batch(1)
-    else:
-        data_ds = tf.data.Dataset.from_tensor_slices(data_reshaped).batch(32)
-        
-    # encode using the trained model
-    data_z_mean = []
-    for batch in data_ds:
-        data_z_mean.append(model.encode(x=batch).mean().numpy())
-    data_z_mean = np.concatenate(data_z_mean)
-    # transpose the data - we want it to have shape (batch_size, time, latent_dim)
-    print("data_z_mean.shape before transpose= ", data_z_mean.shape)
-    data_z_mean = np.transpose(data_z_mean, (0, time_axis, latent_axis))
-    print("data_z_mean.shape after transpose= ", data_z_mean.shape)
-    # reshape the latent variables
-    data_z_mean = np.reshape(data_z_mean,(data_z_mean.shape[0]*data_z_mean.shape[1],data_z_mean.shape[2]))
-    return data_z_mean, labels
+    n_idx  = np.nonzero(labels == 0)
+    an_idx = np.nonzero(labels >= 1)
+    split_boundaries = [0] + z_splits + [z_mean.shape[1]]
+    
+    num_splits = len(split_boundaries)-1
+    fig,ax = plt.subplots(1,num_splits,figsize=(10*num_splits,10))
+    for i in range(num_splits):
+        split = z_mean[:,split_boundaries[i]:split_boundaries[i+1]]
+        split_embedded = TSNE(n_components=2, learning_rate='auto',init='random', perplexity=50).fit_transform(split)
+        ax[i].scatter(split_embedded[n_idx,0]  ,split_embedded[n_idx,1]  ,marker='.',label='normal')
+        ax[i].scatter(split_embedded[an_idx,0] ,split_embedded[an_idx,1] ,marker='.',label='anomaly')
+        ax[i].set_xlabel('x1')
+        ax[i].set_ylabel('x2')
+        ax[i].set_title(titles[i])
+        ax[i].legend()
+    plt.show()
+    return
+
 
 
 class sequence_sampler():
@@ -594,31 +582,76 @@ class sequence_sampler():
     batches are also adjacent in the dataset.
     """
     def __init__(self, data, seq_len, batch_size):
-        self.batch_size = batch_size
+        
         # check the parameters
         if seq_len < 1:
             raise ValueError('seq_len must be at least 1')
-        data_len = data.shape[0]
-        if data_len < seq_len:
+        self.data_len = data.shape[0]
+        if self.data_len < seq_len:
             raise ValueError("number of samples must be at least as large as seq_len")
-        new_size = (data_len // seq_len)* seq_len
-        if new_size == data_len:
+        self.batch_size = None
+        self.seq_len = seq_len
+        self.data_dim = data.shape[1]
+        self.orig_data = data
+
+        
+    def pick_data(self,batch_size):
+        self.batch_size = batch_size
+        new_size = (self.data_len // self.seq_len) * self.seq_len
+        if new_size == self.data_len:
             self.start_timestep = 0
         else:    
-            self.start_timestep = np.random.randint(low=0, high=(data_len % seq_len))
-        self.data = data[self.start_timestep:self.start_timestep+new_size,:]
+            self.start_timestep = np.random.randint(low=0, high=(self.data_len % self.seq_len))
+        self.data = self.orig_data[self.start_timestep:self.start_timestep+new_size,:]
         # reshape data to sequences
-        self.data = np.reshape(self.data,newshape=(-1,seq_len,self.data.shape[1]))
+        self.data = np.reshape(self.data,newshape=(-1,self.seq_len,self.data.shape[1]))
         # collect the batches starting from a random sequence
         if (self.data.shape[0] % self.batch_size) == 0:
             self.start_seq = 0
         else:
-            self.start_seq = np.random.randint(low=0, high=(self.data.shape[0] % batch_size))
+            self.start_seq = np.random.randint(low=0, high=(self.data.shape[0] % self.batch_size))
         self.num_batches = (self.data.shape[0]-self.start_seq) // self.batch_size
+
 
 
     def iterator(self):
                
         for i in range(self.num_batches):
-            yield np.stack([self.data[i + self.start_seq + j * self.num_batches] for j in range(self.batch_size)])
+            yield np.stack([self.data[i + self.start_seq + j * self.num_batches].astype(np.float32) for j in range(self.batch_size)])
+
+    def unit_test(self, orig_data, plot=False):
+        self.pick_data()
+        sequential_batches = []
+        for step, batch in enumerate(self.iterator()):
+            sequential_batches.append(batch)
+
+        # concatenate the batches along the time axis
+        sequences = np.concatenate(sequential_batches,axis=1)        
+        print("sequences.shape = ",sequences.shape)
+        # just a quick sanity check of sizes
+        assert sequences.shape[0] == self.batch_size, f"There should be {self.batch_size} sequences"
+        assert sequences.shape[2] == self.data_dim, "Data dimension doesn't match"
+
+        for i in range(self.batch_size):
+            seq_start = self.start_timestep + self.start_seq * self.seq_len + i * self.num_batches * self.seq_len
+            seq_end = seq_start + sequences.shape[1]
+            orig_sequence = orig_data[seq_start:seq_end]
+            sequence = np.squeeze(sequences[i])
+            if plot:
+                channel = np.random.randint(low=0,high=self.data_dim)
+                fig,ax = plt.subplots(figsize=(6,6))
+                ax.plot(orig_sequence[:,channel],label="orig")
+                ax.plot(sequence[:,channel],'*r',label="batched")
+                ax.legend()
+                ax.set_xlabel('timestep')
+                ax.set_ylabel('y')
+                ax.set_title(f"orig and batched sequences in channel {channel}")
+                ax.legend()
+                plt.show()
+            if not np.array_equal(orig_sequence, sequence):
+                print("batched sequence.shape = ",sequence.shape)
+                print("orig sequence.shape = ",orig_sequence.shape)
+                print(sequence)
+                print(orig_sequence)
+            assert np.array_equal(orig_sequence, sequence), f"in sub sequence {i}, batched sub-sequence does not match the original sequences"
     
