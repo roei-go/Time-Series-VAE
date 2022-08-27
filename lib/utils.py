@@ -270,7 +270,20 @@ def prepare_data_for_imputation_experiment(series, window_size, percent_missing 
     else:
         return full_data_train, full_data_val, full_data_test, miss_data_train, miss_data_val, miss_data_test, mask_train, mask_val, mask_test
 
-def train_loop(model, num_epochs, train_ds, val_ds, optimizer, checkpoint, checkpoint_prefix, gradient_clip=1e3,log_every=10, verbose=False, train_for_imputation = True, use_sequential_ds=False, batch_size_low=32, batch_size_high=64):
+def train_loop(model, 
+               num_epochs, 
+               train_ds, 
+               val_ds, 
+               optimizer, 
+               checkpoint, 
+               checkpoint_prefix, 
+               gradient_clip=1e3,
+               log_every=10, 
+               verbose=False, 
+               train_for_imputation = True, 
+               use_sequential_ds=False, 
+               batch_size_low=32, 
+               batch_size_high=64):
     trainable_vars = model.get_trainable_vars()
     losses_train = []
     kl_term_train = []
@@ -378,8 +391,11 @@ def calculate_f1(labels,tpr,fpr,thresholds):
     return f1, recall, precision, thresholds
 
 
-def get_reconstruction(model, data, labels, seq_len, batch_size=32, return_z_mean=False):
-
+def get_reconstruction(model, data, labels, seq_len, batch_size=32, return_z_mean=False, repeat_kl=None, transpose_z=True):
+    if repeat_kl is not None:
+        repeat_kl = repeat_kl
+    else:
+        repeat_kl = seq_len
     if model.retain_enc_state or model.retain_dec_state:
         # truncate the data size (in time domain) such that the number of samples in an integer multiple of (seq_len*batch_size)
         new_size = data.shape[0] - (data.shape[0] % (seq_len*batch_size))
@@ -413,18 +429,21 @@ def get_reconstruction(model, data, labels, seq_len, batch_size=32, return_z_mea
     for batch_idx, batch in enumerate(iterator):
         if return_z_mean:
             x_hat, kl, z_mean = model.reconstruct(x=batch, return_z_mean=True)
-            # z_mean shape is [batch_size, z_dim, latent_space_seq_len]. transpose to [batch_size, latent_space_seq_len, z_dim]
-            z_mean = tf.transpose(z_mean, perm=[0,2,1])
-            # each latent space sample generates n samples in the data space. 
-            # z_mean = tf.repeat(z_mean,repeats=seq_len//model.latent_space_time_length, axis=1)
+            if transpose_z:
+                # z_mean shape is [batch_size, z_dim, latent_space_seq_len]. transpose to [batch_size, latent_space_seq_len, z_dim]
+                z_mean = tf.transpose(z_mean, perm=[0,2,1])
+            
             z_mean_batches.append(z_mean.numpy())
         else:
             x_hat, kl = model.reconstruct(x=batch)
         data_reconstructed_batches.append(x_hat.numpy())
-        # we have a single KL term for each window in the batch. repeat it seq_len times such that each time point will have that term
-        kl = np.repeat(kl.numpy(), seq_len, axis=1)
+        # we may have a single KL term for each window in the batch. 
+        # in that case repeat it seq_len times such that each time point will have that term
+        # we may also have a KL term for each latent variable - in this case the repeat factor will be given
+        # on function call. in any case we repeat the KL term here to assign each data point its KL term
+        kl = np.repeat(kl.numpy(), repeat_kl, axis=1)
         kl_batches.append(kl)
-
+        
     if model.retain_enc_state or model.retain_dec_state:
         # concatenate the batches along the time axis
         data_reconstructed = np.concatenate(data_reconstructed_batches,axis=1)
@@ -454,9 +473,23 @@ def get_reconstruction(model, data, labels, seq_len, batch_size=32, return_z_mea
         return data, data_reconstructed, kl_reconstructed, labels
 
 
-def get_reconstruction_error(model, data, labels, seq_len, batch_size=32, stateful_encoder=False,stateful_decoder=False):
+def get_reconstruction_error(model, 
+                             data, 
+                             labels, 
+                             seq_len, 
+                             batch_size=32, 
+                             stateful_encoder=False,
+                             stateful_decoder=False, 
+                             repeat_kl=None, 
+                             transpose_z=True):
 
-    data, data_reconstructed, kl_reconstructed, labels = get_reconstruction(model, data, labels, seq_len, batch_size=batch_size)
+    data, data_reconstructed, kl_reconstructed, labels = get_reconstruction(model, 
+                                                                            data, 
+                                                                            labels, 
+                                                                            seq_len, 
+                                                                            batch_size=batch_size, 
+                                                                            repeat_kl=repeat_kl, 
+                                                                            transpose_z=transpose_z)
     # calculate the reconstruction MSE
     print("calculating reconstruction MSE")
     reconstruct_error = np.linalg.norm(data_reconstructed-data,axis=1)
@@ -470,7 +503,7 @@ def get_reconstruction_error(model, data, labels, seq_len, batch_size=32, statef
     recons_plus_kl = reconstruct_error + kl_reconstructed
     recons_plus_kl_fpr, recons_plus_kl_tpr, recons_plus_kl_thresholds = roc_curve(y_true=labels, y_score=recons_plus_kl/np.max(recons_plus_kl))
     recons_plus_kl_auc = roc_auc_score(y_true=labels, y_score=recons_plus_kl/np.max(recons_plus_kl))
-    print(f"reconst error plus KL based AUC is {recons_plus_kl_auc}")
+    
 
 
     # separate the reconstruction errors of the "normal" measurements and the "abnormal" ones
@@ -485,26 +518,18 @@ def get_reconstruction_error(model, data, labels, seq_len, batch_size=32, statef
     f1, recall, precision, thresholds = calculate_f1(labels,tpr,fpr,thresholds)
     max_f1 = np.max(f1)
     print(f"F1 max is {max_f1}")
-    f1_with_kl, _, _, _ = calculate_f1(labels,recons_plus_kl_tpr,recons_plus_kl_fpr,recons_plus_kl_thresholds)
-    print(f"with KL term, F1 max is {np.max(f1_with_kl)}")
-    fig,ax = plt.subplots(1,2,figsize=(12,6))
-    ax[0].hist(normal_reconst_error,bins=100,label="normal")
-    ax[0].hist(abnormal_reconst_error,bins=100,label="anomaly")
-    ax[0].legend()
-    ax[0].set_xlabel('error magnitude')
-    ax[0].set_ylabel('count')
-    ax[0].set_title(f"reconstruction errors histograms")
+    
+    fig,ax = plt.subplots(figsize=(12,6))
+    ax.hist(normal_reconst_error,bins=100,label="normal")
+    ax.hist(abnormal_reconst_error,bins=100,label="anomaly")
+    ax.legend()
+    ax.set_xlabel('error magnitude')
+    ax.set_ylabel('count')
+    ax.set_title(f"reconstruction errors histograms")
 
-    ax[1].hist(normal_reconst_error_plus_kl,bins=100,label="normal")
-    ax[1].hist(abnormal_reconst_error_plus_kl,bins=100,label="anomaly")
-    ax[1].legend()
-    ax[1].set_xlabel('error magnitude')
-    ax[1].set_ylabel('count')
-    ax[1].set_title(f"reconstruction errors plus KL term histograms")
     plt.show()
     fig,ax = plt.subplots(1,2,figsize=(12,6))
     ax[0].plot(fpr,tpr,label="reconstruction based")
-    ax[0].plot(recons_plus_kl_fpr,recons_plus_kl_tpr,label="with KL")
     ax[0].set_xlabel('fpr')
     ax[0].set_ylabel('tpr')
     ax[0].set_title(f"ROC curve for anomaly detection")
@@ -529,6 +554,32 @@ def get_reconstruction_error(model, data, labels, seq_len, batch_size=32, statef
                     'precision'                 : precision, 
                     'reconstruct_error'         : reconstruct_error}
     return results_dict
+
+
+def get_perf_from_scores(scores,labels):
+    fpr, tpr, thresholds = roc_curve(y_true=labels, y_score=scores)
+    auc = roc_auc_score(y_true=labels, y_score=scores)
+    print(f"AUC is {auc}")
+    f1, recall, precision, thresholds = calculate_f1(labels,tpr,fpr,thresholds)
+    max_f1 = np.max(f1)
+    print(f"F1 best is {max_f1}")
+    # separate the scores of normal and anomalies
+    normal_scores_idx  = np.nonzero(labels == 0)
+    anomaly_scores_idx = np.nonzero(labels >= 1)
+    normal_scores  = scores[normal_scores_idx]
+    anomaly_scores = scores[anomaly_scores_idx]
+    # plot scores
+    fig,ax = plt.subplots(figsize=(12,6))
+    ax.hist(normal_scores,bins=100,label="normal")
+    ax.hist(anomaly_scores,bins=100,label="anomaly")
+    ax.legend()
+    ax.set_xlabel('score')
+    ax.set_ylabel('count')
+    ax.set_title(f"anomaly scores histograms")
+    plt.show()
+    
+
+    return auc, max_f1
 
 def observe_latent_variables_means_distributions(means,labels):
     z_dim = means.shape[1]
@@ -564,14 +615,44 @@ def embed_latent_representation(z_mean, labels, sample_size, z_splits, titles):
     for i in range(num_splits):
         split = z_mean[:,split_boundaries[i]:split_boundaries[i+1]]
         split_embedded = TSNE(n_components=2, learning_rate='auto',init='random', perplexity=50).fit_transform(split)
-        ax[i].scatter(split_embedded[n_idx,0]  ,split_embedded[n_idx,1]  ,marker='.',label='normal')
-        ax[i].scatter(split_embedded[an_idx,0] ,split_embedded[an_idx,1] ,marker='.',label='anomaly')
-        ax[i].set_xlabel('x1')
-        ax[i].set_ylabel('x2')
-        ax[i].set_title(titles[i])
-        ax[i].legend()
+        if num_splits == 1:
+            axh = ax
+        else:
+            axh = ax[i]
+        axh.scatter(split_embedded[n_idx,0]  ,split_embedded[n_idx,1]  ,marker='.',label='normal')
+        axh.scatter(split_embedded[an_idx,0] ,split_embedded[an_idx,1] ,marker='.',label='anomaly')
+        axh.set_xlabel('x1')
+        axh.set_ylabel('x2')
+        axh.set_title(titles[i])
+        axh.legend()
     plt.show()
     return
+
+def get_latent_space_reconst_err(z, data_space_reconst_err, use_mean=True):
+    """
+    This function extracts a latent variable "reconstruction error" from the associated reconstructed data error.
+    Since every latent variable generates n data samples (n is the downsampling ratio of the encoder), the latent
+    variable reconst error is defined as either the mean or max reconst errors of these n reconstructed data 
+    samples
+    :param z: latent representation. shape [number of latent variables, latent dim]
+    :param data_space_reconst_err: the time point reconstruction error. shape [series_len,]
+    """
+    pass
+
+def latent_out_anomaly_score(z, reconstruct_error, k):
+    """
+    This function creates an anomaly score based on a "VaeOut" space add citation
+    it concatenates the reconstruction error of an observation to its latent representation, to create a set of
+    vectors V. For each point it calculates the average distance to it's K nearest neighbors 
+    :param z: latent representation. shape [number of latent variables, latent dim]
+    :param reconstruct_error: the time point reconstruction error. shape [number of latent variables,]
+    """
+    s = np.concatenate([z,reconstruct_error], axis=1)
+    knn = sklearn.knn(s,k)
+    # get the distance to the K nearest neighbors
+    dist = knn.get_dist(s)
+    avg_dist = np.mean(dist, axis=1)
+    return avg_dist
 
 
 
