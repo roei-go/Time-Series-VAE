@@ -628,34 +628,6 @@ def embed_latent_representation(z_mean, labels, sample_size, z_splits, titles):
     plt.show()
     return
 
-def get_latent_space_reconst_err(z, data_space_reconst_err, use_mean=True):
-    """
-    This function extracts a latent variable "reconstruction error" from the associated reconstructed data error.
-    Since every latent variable generates n data samples (n is the downsampling ratio of the encoder), the latent
-    variable reconst error is defined as either the mean or max reconst errors of these n reconstructed data 
-    samples
-    :param z: latent representation. shape [number of latent variables, latent dim]
-    :param data_space_reconst_err: the time point reconstruction error. shape [series_len,]
-    """
-    pass
-
-def latent_out_anomaly_score(z, reconstruct_error, k):
-    """
-    This function creates an anomaly score based on a "VaeOut" space add citation
-    it concatenates the reconstruction error of an observation to its latent representation, to create a set of
-    vectors V. For each point it calculates the average distance to it's K nearest neighbors 
-    :param z: latent representation. shape [number of latent variables, latent dim]
-    :param reconstruct_error: the time point reconstruction error. shape [number of latent variables,]
-    """
-    s = np.concatenate([z,reconstruct_error], axis=1)
-    knn = sklearn.knn(s,k)
-    # get the distance to the K nearest neighbors
-    dist = knn.get_dist(s)
-    avg_dist = np.mean(dist, axis=1)
-    return avg_dist
-
-
-
 class sequence_sampler():
     """
     Samples indices from a dataset containing consecutive sequences.

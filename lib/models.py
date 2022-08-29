@@ -96,7 +96,7 @@ class gpdir_encoder(tf.keras.Model):
             for i in range(len(dir_fc_sizes)):
                 self.dir_fc_layers.append(tf.keras.layers.Dense(units=dir_fc_sizes[i] ,dtype=tf.float32, activation='elu', name=f"dir_mlp_layer_{i}"))
         # define a fully connected layer to learn alpha of the dirichlet distribution. Note the activation is a softplus since all alphas should be strictly positive
-        self.latent_dirichlet_alpha_layer = tf.keras.layers.Dense(units=self.dz_dim, activation='sigmoid', dtype=tf.float32, name=f"latent_dirichlet_alpha_layer")
+        self.latent_dirichlet_alpha_layer = tf.keras.layers.Dense(units=self.dz_dim, activation='softmax', dtype=tf.float32, name=f"latent_dirichlet_alpha_layer")
 
     def call(self, x, states=None):
         # encode the input. The encoded input has shape [batch_size, seq_len, hidden_size]
